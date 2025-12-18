@@ -30,8 +30,10 @@
 #include <cstdint>
 #include <fstream>
 #include <print>
+#include <ranges>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 // clang-format off
 static constexpr std::array<std::uint8_t, 256> encoding = {
@@ -55,6 +57,18 @@ static constexpr std::array<std::uint8_t, 256> encoding = {
 // clang-format on
 
 static constexpr auto n_nucs = 4u;
+static const auto dinucs = std::vector{
+  "CA",
+  "CC",
+  "CG",
+  "CT",
+};
+static const auto dinucs_rev = std::vector{
+  "CT",
+  "CG",
+  "CC",
+  "CA",
+};
 
 struct mod_prob_stats {
   static constexpr auto max_mods = 10;
@@ -69,6 +83,7 @@ struct mod_prob_stats {
   std::array<std::array<std::uint64_t, n_values>, n_nucs> hydroxy_rev{};
 
   mod_prob_stats() : m{hts_base_mod_state_alloc(), &hts_base_mod_state_free} {};
+  mod_prob_stats(const mod_prob_stats &rhs) = default;
 
   [[nodiscard]] auto
   operator()(const bam1_t *aln) {
@@ -110,10 +125,54 @@ struct mod_prob_stats {
                                  hydroxy_fwd, hydroxy_rev)
 };
 
+struct mod_prob_stats_fmt {
+  std::map<std::string, std::vector<std::uint64_t>> methyl;
+  std::map<std::string, std::vector<std::uint64_t>> hydroxy;
+  mod_prob_stats_fmt(const mod_prob_stats &mps) {
+    const auto v_sum = [](auto &a, const auto &b) {
+      std::ranges::transform(a, b, std::begin(a), std::plus{});
+    };
+    const auto sum_to_map = [&](const auto &f, const auto &r) {
+      auto work = f;
+      for (auto i = 0u; i < n_nucs; ++i)
+        v_sum(work[i], r[n_nucs - 1 - i]);
+      std::map<std::string, std::vector<std::uint64_t>> result;
+      for (const auto &[idx, vals] : std::views::enumerate(work))
+        result[dinucs[idx]] = std::vector(std::cbegin(vals), std::cend(vals));
+      return result;
+    };
+    methyl = sum_to_map(mps.methyl_fwd, mps.methyl_rev);
+    hydroxy = sum_to_map(mps.hydroxy_fwd, mps.hydroxy_rev);
+  }
+  NLOHMANN_DEFINE_TYPE_INTRUSIVE(mod_prob_stats_fmt, methyl, hydroxy)
+};
+
+struct mod_prob_stats_fmt_stranded {
+  std::map<std::string, std::vector<std::uint64_t>> methyl_fwd;
+  std::map<std::string, std::vector<std::uint64_t>> methyl_rev;
+  std::map<std::string, std::vector<std::uint64_t>> hydroxy_fwd;
+  std::map<std::string, std::vector<std::uint64_t>> hydroxy_rev;
+  mod_prob_stats_fmt_stranded(const mod_prob_stats &mps) {
+    const auto to_map = [&](const auto &x, const auto &y) {
+      std::map<std::string, std::vector<std::uint64_t>> result;
+      for (const auto &[idx, vals] : std::views::enumerate(x))
+        result[y[idx]] = std::vector(std::cbegin(vals), std::cend(vals));
+      return result;
+    };
+    methyl_fwd = to_map(mps.methyl_fwd, dinucs);
+    methyl_rev = to_map(mps.methyl_rev, dinucs_rev);
+    hydroxy_fwd = to_map(mps.hydroxy_fwd, dinucs);
+    hydroxy_rev = to_map(mps.hydroxy_rev, dinucs_rev);
+  }
+  NLOHMANN_DEFINE_TYPE_INTRUSIVE(mod_prob_stats_fmt_stranded, methyl_fwd,
+                                 methyl_rev, hydroxy_fwd, hydroxy_rev)
+};
+
 int
 main(int argc, char *argv[]) {  // NOLINT(*-c-arrays)
   std::string outfile;
   std::string infile;
+  bool stranded{};
 
   CLI::App app{};
   argv = app.ensure_utf8(argv);
@@ -125,6 +184,7 @@ main(int argc, char *argv[]) {  // NOLINT(*-c-arrays)
     ->check(CLI::ExistingFile);
   app.add_option("-o,--output", outfile, "JSON output file")
     ->required();
+  app.add_flag("--stranded", stranded, "output strand-specific results");
   // clang-format on
 
   if (argc < 2) {
@@ -159,7 +219,12 @@ main(int argc, char *argv[]) {  // NOLINT(*-c-arrays)
   std::ofstream out(outfile);
   if (!out)
     throw std::runtime_error("Error opening output file: " + outfile);
-  out << nlohmann::json(mps).dump(4) << "\n";
+
+  if (stranded)
+    std::println(out, "{}",
+                 nlohmann::json(mod_prob_stats_fmt_stranded(mps)).dump(4));
+  else
+    std::println(out, "{}", nlohmann::json(mod_prob_stats_fmt(mps)).dump(4));
 
   return EXIT_SUCCESS;
 }
